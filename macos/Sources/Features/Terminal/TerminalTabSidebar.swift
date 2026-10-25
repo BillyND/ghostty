@@ -304,6 +304,9 @@ struct TerminalTabSidebarLayout<Content: View>: View {
                     .environment(\.colorScheme, NSColor(ghostty.config.backgroundColor).isLightColor ? .light : .dark)
 
                 divider
+                    // The grab strip reaches over the terminal's edge, so it has to sit
+                    // above the terminal to be reachable from that side too.
+                    .zIndex(1)
             }
 
             content
@@ -316,18 +319,24 @@ struct TerminalTabSidebarLayout<Content: View>: View {
             .frame(width: TerminalTabSidebar.dividerWidth)
             .overlay {
                 if !isCollapsed {
-                    // A wider invisible strip so the divider is easy to grab.
+                    // A wider invisible strip so the divider is easy to grab. The cursor is
+                    // set like the split divider's: the terminal sets its own pointer style,
+                    // which a pushed cursor can't reliably win against.
                     Color.clear
                         .frame(width: 7)
                         .contentShape(Rectangle())
-                        .gesture(resizeGesture)
+                        .backport.pointerStyle(.resizeLeftRight)
                         .onHover { isHovering in
+                            // macOS 15+ uses the pointer style above.
+                            if #available(macOS 15, *) { return }
+
                             if isHovering {
                                 NSCursor.resizeLeftRight.push()
                             } else {
                                 NSCursor.pop()
                             }
                         }
+                        .gesture(resizeGesture)
                 }
             }
     }
@@ -356,8 +365,9 @@ struct TerminalTabSidebar: View {
     static let dividerWidth: Double = 1
 
     /// Every row has the same height, so a tab's position in the list is a multiple of
-    /// the pitch and dragging needs no measuring.
-    static let rowHeight: CGFloat = 28
+    /// the pitch and dragging needs no measuring. Rows are tall enough for a two-line title.
+    static let rowHeight: CGFloat = 52
+    static let rowCornerRadius: CGFloat = 12
     static let tileSize: CGFloat = 30
     static let rowSpacing: CGFloat = 2
 
@@ -637,8 +647,8 @@ private extension View {
     }
 }
 
-/// One tab in the sidebar: a pill-shaped row when the sidebar is expanded, or a round
-/// tile showing its key equivalent in the collapsed rail. The selected tab is drawn on glass like a native tab.
+/// One tab in the sidebar: a rounded row with up to two lines of title when the sidebar
+/// is expanded, or a round tile showing its key equivalent in the collapsed rail. The selected tab is drawn on glass like a native tab.
 private struct TerminalTabSidebarRow: View {
     let model: TerminalTabSidebarModel
     let tab: TerminalTabSidebarModel.Tab
@@ -650,13 +660,13 @@ private struct TerminalTabSidebarRow: View {
         content
             .font(.system(size: 13))
             .foregroundStyle(Color.primary.opacity(tab.isSelected ? 1 : 0.75))
-            .background(Capsule().fill(hoverFill))
+            .background(shape.fill(hoverFill))
             .terminalTabSidebarGlass(
-                in: Capsule(),
+                in: shape,
                 isEnabled: tab.isSelected,
                 fallback: Color.primary.opacity(0.14)
             )
-            .contentShape(Capsule())
+            .contentShape(shape)
             .onTapGesture { model.select(tab) }
             // Simultaneous so a single click still selects the tab at once, rather than
             // waiting to see whether a second click follows.
@@ -672,6 +682,14 @@ private struct TerminalTabSidebarRow: View {
 
     private var hoverFill: Color {
         Color.primary.opacity(!tab.isSelected && isHovering ? 0.08 : 0)
+    }
+
+    /// A round tile when compact. A full-height capsule would leave a two-line row with
+    /// huge rounded ends, so rows get rounded corners instead.
+    private var shape: RoundedRectangle {
+        RoundedRectangle(
+            cornerRadius: isCompact ? TerminalTabSidebar.tileSize / 2 : TerminalTabSidebar.rowCornerRadius,
+            style: .continuous)
     }
 
     @ViewBuilder
@@ -716,8 +734,9 @@ private struct TerminalTabSidebarRow: View {
             .frame(width: 22, height: 22)
 
             Text(tab.title)
-                .lineLimit(1)
+                .lineLimit(2)
                 .truncationMode(.tail)
+                .multilineTextAlignment(.leading)
 
             Spacer(minLength: 4)
 
