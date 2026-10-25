@@ -154,6 +154,47 @@ final class TerminalTabSidebarModel: ObservableObject {
         (tabWindow(for: tab) as? TerminalWindow)?.tabColor = color
     }
 
+    /// Moves a tab so it sits before the tab now at `slot`, or last when `slot` is the
+    /// number of tabs. The selected tab stays selected and every tab keeps its terminal:
+    /// only the tab group's order changes.
+    func move(_ tab: Tab, toSlot slot: Int) {
+        let windows = tabWindows
+        guard let source = windows.firstIndex(where: { ObjectIdentifier($0) == tab.id }),
+              let destination = TerminalTabSidebar.destinationIndex(
+                movingFrom: source,
+                toSlot: slot,
+                count: windows.count),
+              let tabGroup = window?.tabGroup
+        else { return }
+
+        let moving = windows[source]
+        var remaining = windows
+        remaining.remove(at: source)
+        let selected = tabGroup.selectedWindow
+
+        // Like `move_tab`, take the window out of the group and add it back beside its new
+        // neighbor, without animation so the window never shows on its own.
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.current.duration = 0
+
+        tabGroup.removeWindow(moving)
+        if destination == 0 {
+            remaining[0].addTabbedWindowSafely(moving, ordered: .below)
+        } else {
+            remaining[destination - 1].addTabbedWindowSafely(moving, ordered: .above)
+        }
+
+        if let selected {
+            tabGroup.selectedWindow = selected
+            selected.makeKey()
+        }
+
+        NSAnimationContext.endGrouping()
+
+        // The key equivalents follow the position, so relabel. This also refreshes the sidebar.
+        ((selected ?? moving).windowController as? TerminalController)?.relabelTabs()
+    }
+
     /// The right-click menu for a tab. It has the same items as a native tab's menu, including
     /// the tab color palette, which is why it is an AppKit menu: the palette is a custom menu
     /// item view and SwiftUI menus can't hold one.
@@ -314,6 +355,41 @@ struct TerminalTabSidebar: View {
     static let collapsedWidth: Double = 40
     static let dividerWidth: Double = 1
 
+    /// Every row has the same height, so a tab's position in the list is a multiple of
+    /// the pitch and dragging needs no measuring.
+    static let rowHeight: CGFloat = 28
+    static let tileSize: CGFloat = 30
+    static let rowSpacing: CGFloat = 2
+
+    /// The slot a tab dragged from `index` by `offset` points would be dropped into. Slot
+    /// `n` means before the tab at `n`, and `count` means after the last tab. The tab moves
+    /// past a neighbor once its center crosses the neighbor's center.
+    static func dropSlot(from index: Int, offset: CGFloat, pitch: CGFloat, count: Int) -> Int {
+        let slot = (CGFloat(index) + 1 + offset / pitch).rounded(.down)
+        return min(max(Int(slot), 0), count)
+    }
+
+    /// Where a tab moving from `source` to `slot` ends up once it is out of its old place,
+    /// or nil when the drop leaves it where it is.
+    static func destinationIndex(movingFrom source: Int, toSlot slot: Int, count: Int) -> Int? {
+        guard (0..<count).contains(source), (0...count).contains(slot) else { return nil }
+        guard slot != source, slot != source + 1 else { return nil }
+        return slot > source ? slot - 1 : slot
+    }
+
+    /// How many rows the tab at `row` shifts to make room while the tab at `source` is
+    /// dragged over `slot`: -1 (up), 1 (down) or 0, so the list already shows the order
+    /// the drop would make.
+    static func displacement(ofRowAt row: Int, draggingFrom source: Int, toSlot slot: Int, count: Int) -> Int {
+        guard row != source,
+              let destination = destinationIndex(movingFrom: source, toSlot: slot, count: count)
+        else { return 0 }
+
+        if destination > source, row > source, row <= destination { return -1 }
+        if destination < source, row >= destination, row < source { return 1 }
+        return 0
+    }
+
     /// The width the sidebar and its divider currently take out of a window's content.
     static var occupiedWidth: CGFloat {
         let defaults = UserDefaults.standard
@@ -328,6 +404,26 @@ struct TerminalTabSidebar: View {
     @ObservedObject var model: TerminalTabSidebarModel
     @Binding var isCollapsed: Bool
 
+    /// The tab being dragged to a new position. It resets by itself when the drag ends or
+    /// is cancelled, so a lost mouse-up can't leave a row stuck out of place. The reset
+    /// isn't animated: by then the tabs already sit where the rows were shifted to.
+    @GestureState(resetTransaction: TerminalTabSidebar.instantTransaction)
+    private var drag: TabDrag?
+
+    private static var instantTransaction: Transaction {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        return transaction
+    }
+
+    private struct TabDrag: Equatable {
+        let id: ObjectIdentifier
+
+        /// The 0-based position of the tab when the drag began.
+        let index: Int
+        let offset: CGFloat
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if isCollapsed {
@@ -339,12 +435,8 @@ struct TerminalTabSidebar: View {
                 .padding(.bottom, 6)
 
                 ScrollView(showsIndicators: false) {
-                    LazyVStack(spacing: 2) {
-                        ForEach(model.tabs) { tab in
-                            TerminalTabSidebarRow(model: model, tab: tab, isCompact: true)
-                        }
-                    }
-                    .padding(.bottom, 6)
+                    tabList(isCompact: true)
+                        .padding(.bottom, 6)
                 }
             } else {
                 HStack {
@@ -356,17 +448,69 @@ struct TerminalTabSidebar: View {
                 .frame(height: 40)
 
                 ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(model.tabs) { tab in
-                            TerminalTabSidebarRow(model: model, tab: tab, isCompact: false)
-                        }
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.bottom, 6)
+                    tabList(isCompact: false)
+                        .padding(.horizontal, 6)
+                        .padding(.bottom, 6)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func tabList(isCompact: Bool) -> some View {
+        let pitch = (isCompact ? Self.tileSize : Self.rowHeight) + Self.rowSpacing
+
+        let count = model.tabs.count
+
+        // Where the dragged tab came from and the slot under it, worked out once per
+        // pointer move.
+        let target = drag.map {
+            (source: $0.index, slot: Self.dropSlot(from: $0.index, offset: $0.offset, pitch: pitch, count: count))
+        }
+
+        return LazyVStack(spacing: Self.rowSpacing) {
+            ForEach(model.tabs) { tab in
+                let isDragged = drag?.id == tab.id
+                let shift = target.map {
+                    Self.displacement(ofRowAt: tab.index - 1, draggingFrom: $0.source, toSlot: $0.slot, count: count)
+                } ?? 0
+
+                TerminalTabSidebarRow(model: model, tab: tab, isCompact: isCompact)
+                    // Rows only move by a transform, so neither following the pointer nor
+                    // making room costs any layout. The other rows only change when the
+                    // dragged tab crosses a neighbor's center, and slide there.
+                    .offset(y: isDragged ? drag?.offset ?? 0 : CGFloat(shift) * pitch)
+                    .animation(.easeOut(duration: 0.15), value: shift)
+                    .opacity(isDragged ? 0.8 : 1)
+                    .zIndex(isDragged ? 1 : 0)
+                    .gesture(reorderGesture(for: tab, pitch: pitch), including: count > 1 ? .all : .subviews)
+            }
+        }
+        .coordinateSpace(name: Self.listSpace)
+    }
+
+    private static let listSpace = "TerminalTabSidebarList"
+
+    private func reorderGesture(for tab: TerminalTabSidebarModel.Tab, pitch: CGFloat) -> some Gesture {
+        // Measured in the list's space, not the row's: the row itself moves with the drag.
+        // The minimum distance leaves clicks and double-clicks to the row.
+        DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.listSpace))
+            .updating($drag) { value, state, _ in
+                state = TabDrag(id: tab.id, index: tab.index - 1, offset: value.translation.height)
+            }
+            .onEnded { value in
+                let slot = Self.dropSlot(
+                    from: tab.index - 1,
+                    offset: value.translation.height,
+                    pitch: pitch,
+                    count: model.tabs.count)
+
+                // The rows already show the new order, so the real move must not animate
+                // them a second time.
+                withTransaction(Self.instantTransaction) {
+                    model.move(tab, toSlot: slot)
+                }
+            }
     }
 
     private var collapseButton: some View {
@@ -543,7 +687,7 @@ private struct TerminalTabSidebarRow: View {
         // The key equivalent that selects the tab (e.g. ⌘1), or its position when it has none.
         Text(tab.keyEquivalent ?? "\(tab.index)")
             .font(.system(size: 11))
-            .frame(width: 30, height: 30)
+            .frame(width: TerminalTabSidebar.tileSize, height: TerminalTabSidebar.tileSize)
             .overlay(alignment: .topTrailing) {
                 if let color = tab.color.displayColor {
                     Circle()
@@ -585,7 +729,7 @@ private struct TerminalTabSidebarRow: View {
         }
         .padding(.leading, 4)
         .padding(.trailing, 10)
-        .frame(height: 28)
+        .frame(height: TerminalTabSidebar.rowHeight)
     }
 }
 
